@@ -1,0 +1,833 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Mar 15 10:45:41 2019
+
+@author: zero
+"""
+#-------------------------------------调用包----------------------------
+import pandas as pd
+import copy
+import datetime
+import numpy as np
+from math import isnan
+import time
+import os
+import re
+#----------------------------------自定义函数-----------------------------
+#---------地市维度一解率函数
+def GetData(input_path):
+    if 'xlsx' in input_path:
+        data = pd.read_excel(input_path)
+    elif 'csv' in input_path:
+        with open(input_path, encoding='utf-8') as file:
+            data = pd.read_csv(file)
+    data.columns = ['CALLEDNUM', 'CALLNUM', 'CALLID', 'DTIME', 'SBJG','WFROM', 'RGCALLID', '客户分群', '语种']   #若平台取数需重新命名字段名
+    data['DTIME'] = pd.to_datetime(data['DTIME'])
+    data = data[['CALLNUM', 'DTIME', 'SBJG', 'CALLEDNUM', 'CALLID', 'RGCALLID','WFROM']] 
+    return data
+
+def GetDataByLoc(data, loc_):
+    return data[data['CALLEDNUM'] == loc_]
+
+def GetDataByDay(data, day_):
+    return data[data['DTIME'].apply(lambda x: x.day == day_)]
+#提出特殊用户群体后，一解率对比分析是需要
+'''
+def GetNumber(file):
+    del_number = pd.read_excel(file)
+    del_number = list(del_number['特殊号码'])
+    return del_number
+
+def SetNumber(df, del_number):
+    number = df[df['客户分群'] == '骚扰客户'][['CALLNUM']]    
+    number['特殊客户'] = '骚扰客户'
+    number1 = df[df['CALLNUM'].isin(del_number)][['CALLNUM']]
+    number1['特殊客户'] = '特殊客户'
+    number2 = pd.concat([number, number1])
+    number2 = number2.drop_duplicates()
+    return number2
+'''
+#纯人工场景数据读入，有特殊地市情况不一样
+def get_delelist(file, loc_):
+    with open(file, encoding='utf-8') as f:
+        dele_table = pd.read_table(f, sep=',')
+    dele_list = []
+    for i in dele_table.columns:
+        dele_list.append(i.strip().replace("''", ""))
+    if  '深圳' in loc_:
+        dele_list.append('改套餐')
+    return dele_list
+
+#建立纯人工场景匹配表
+def SetDelelist(df,dele_list):  
+    df['纯人工'] = df['SBJG'].apply(lambda x:1 if str(x) in dele_list[1:] else 0)
+    chun_callid = df[df['纯人工'] != 0][['CALLID','纯人工']].drop_duplicates()
+    return chun_callid
+
+#建立“转人工”场景匹配表
+def SetZRGlist(df,dele_list):
+    df['转人工'] = df['SBJG'].apply(lambda x:1 if x == '转人工' else 0)
+    zrg_callid = df[df['转人工'] != 0][['CALLID','转人工']].drop_duplicates()
+    return zrg_callid
+
+#建立rgcallid匹配表
+def SetRgcallidTable(df):
+    df['rgcallid'] = df['RGCALLID'].apply(lambda x:1 if type(x) == str else 0)
+    rgcallid_callid = df[df['rgcallid'] == 1][['CALLID','RGCALLID']].drop_duplicates()
+    return rgcallid_callid
+
+#按通话维度进行统计，需汇聚同通电话的不同识别结果
+def order_by_callid(df):
+    callid_list = list(set(df['CALLID']))
+    for callid in callid_list:
+        df_ = df[df['CALLID'] == callid]
+        SBJG_list = list(df_['SBJG'])
+        time_start = list(df_['DTIME'])[0]
+        callnum = list(df_['CALLNUM'])[0]
+        yield callnum, time_start, SBJG_list, callid
+         
+#建立
+def getSameTable(df2):                        
+    number_list = list(set(df2['CALLNUM']))          
+    for number in number_list:
+        df_ = df2[df2['CALLNUM'] == number]  
+        df_ = df_.sort_values(by= 'time_start', ascending = True)
+        time_list = list(df_['time_start'])
+        callid_list = list(df_['CALLID'])
+        result_ = list(df_['result_list'])
+        length = len(callid_list)
+     #测试中
+        for i in range(length):
+            for j in range(1, length):     #判断一通电话后两小时内是否存在相同场景情况。存在则打标1
+                s_ = (time_list[j] - time_list[i]).seconds
+                d_ = (time_list[j] - time_list[i]).days
+                if d_ == 0 and s_ > 0 and s_ <= 7200:  
+                    result = list(set(result_[i])) + list(set(result_[j]))
+                    if len(result) > len(set(result)):
+                        yield(callid_list[i], 1)
+                        break                       
+
+             
+#相同场景与callid连表
+#-----190314该函数融合场景维度和地市维度判断
+def SetSameTable(df2):
+    if len(df2.columns) == 10:       #用于按场景维度中；按场景命中频率统计；同一通电话命中相同场景，分开计算
+        same_callid = pd.DataFrame(getSameTable_CJB(df2))
+        same_callid.columns = ['CALLID','DTIME', 'SBJG','两小时内相同场景']
+         
+    else:                           #用于按地市维度一解率判断 
+        same_callid = pd.DataFrame(getSameTable(df2))
+        same_callid.columns = ['CALLID','两小时内相同场景']
+    same_callid = same_callid.drop_duplicates()
+    return same_callid
+
+#连表
+def MergeTable(df2):
+    df2 = pd.merge(df2, rgcallid_callid, how = 'left', on = ['CALLID'])
+    df2 = pd.merge(df2, same_callid, how = 'left', on = ['CALLID'])
+    df2 = pd.merge(df2, chun_callid, how = 'left', on = ['CALLID'])
+    df2 = pd.merge(df2, zrg_callid, how = 'left', on = ['CALLID'])
+ #   df2 = pd.merge(df2, number_, how = 'left', on = ['CALLNUM'])    #存在特殊客户群体才需要
+    return df2
+
+#2小时内”转人工“场景的callid
+def gettwohour_ZRGTable(df3):
+    number_list = list(set(df3['CALLNUM'])) 
+   
+    if "time_start" in list(df3.columns):         #按地市维度统计结果
+        for number in number_list:
+            df_ = df3[df3['CALLNUM'] == number]
+            #按时间排序
+            df_ = df_.sort_values(by = 'time_start', axis = 0, ascending = True)
+            callid_list = list(df_['CALLID'])
+            for index, callid in enumerate(callid_list):
+                time_ = df_['time_start'][df_['CALLID'] == callid].values[0] 
+                df2_ = df_[df_['time_start'].apply(
+                    lambda x:(x-time_).seconds < 7200 and (x-time_).seconds >= 0)]
+                if 1 in list(df2_['转人工']):
+                    yield(callid,1)
+                    continue
+                    
+    else:                                       #按场景维度统计
+     #   df3 = df3.sort_values(by = ['CALLNUM', 'DTIME'], axis = 0, ascending = True)
+        for number in number_list:
+            df_ = df3[df3['CALLNUM'] == number]
+            df_ = df_.sort_values(by = ['DTIME'],axis = 0,ascending = True)   #按时间排序
+            callid_list = list(df_['CALLID'])
+            for index, callid in enumerate(callid_list):
+                time_ = df_['DTIME'][df_['CALLID'] == callid].values[0] 
+                df2_ = df_[df_['DTIME'].apply(
+                    lambda x:(x-time_).seconds < 7200 and (x-time_).seconds >= 0)]
+                if 1 in list(df2_['转人工']):
+                    yield(callid,1)
+                    continue
+                     
+#2小时内”转人工“场景与callid连表
+def Settwohour_ZRGTable(df3):
+    ZRG_callid = pd.DataFrame(gettwohour_ZRGTable(df3))
+    ZRG_callid.columns = ['CALLID', '两小时内转人工']
+    ZRG_callid = ZRG_callid.drop_duplicates()
+    return ZRG_callid
+
+# 2小时内用户进入人工队列（rgcallid)
+# 临时性调整及，话费查询存在rgcallid的取消统计
+def Gettwohour_RGcallidTable(df3): 
+    if "time_start" in list(df3.columns):         #按地市维度统计结果
+ #       df3 = df3.sort_values(by= ['CALLNUM', 'time_start'], ascending = True)
+        number_list = list(set(df3['CALLNUM']))
+        for number in number_list:
+            df_ = df3[df3['CALLNUM'] == number]
+            df_ = df_.sort_values(by= 'time_start', ascending = True)
+#            df_.reset_index(drop=True)
+            time_list = list(df_['time_start'])
+            callid_list = list(df_['CALLID'])
+            rgcallid_ = list(df_['RGCALLID'].apply(lambda x:1 if type(x) == str else 0))
+            chun_ = list(df_['纯人工'])
+            length = len(callid_list)
+
+            for i in range(length):
+                for j in range(length):
+                    s_ = (time_list[j] - time_list[i]).seconds
+                    d_ = (time_list[j] - time_list[i]).days
+                    if d_ == 0 and s_ >= 0 and s_ < 7200:
+                        if rgcallid_[j] == 1 and chun_[j] != 1:      #2小时通话存在转人工服务打标为失败
+                            yield (callid_list[i], 1)
+                            break     
+                            
+    else:                                        #按场景维度统计
+        number_list = list(set(df3['CALLNUM']))
+        for number in number_list:
+            df_ = df3[df3['CALLNUM'] == number]
+            df_ = df_.sort_values(by= 'DTIME', ascending = True)
+ #           df_.reset_index(drop=True)
+            time_list = list(df_['DTIME'])
+            callid_list = list(df_['CALLID'])        
+            rgcallid_ = list(df_['RGCALLID'].apply(lambda x:1 if type(x) == str else 0))
+     #       rgcallid_ = list(df_['rgcallid'])
+            chun_ = list(df_['纯人工'])
+            length = len(callid_list)
+
+            for i in range(length):
+                for j in range(length):
+                    s_ = (time_list[j] - time_list[i]).seconds
+                    d_ = (time_list[j] - time_list[i]).days
+                    if d_ == 0 and s_ >= 0 and s_ < 7200:
+                        if rgcallid_[j] == 1 and chun_[j] != 1:      #2小时通话存在转人工服务打标为失败
+                            yield (callid_list[i], 1)
+                            break     
+            
+#2小时内rgcallid与callid连表
+def Settwohour_RGcallidTable(df3):
+    TwoHourRGcallid_callid = pd.DataFrame(Gettwohour_RGcallidTable(df3))
+    if TwoHourRGcallid_callid.empty:
+        TwoHourRGcallid_callid = pd.DataFrame(columns = ['CALLID','两小时内进入rgcallid'])
+    else:
+        TwoHourRGcallid_callid.columns = ['CALLID','两小时内进入rgcallid']
+        TwoHourRGcallid_callid = TwoHourRGcallid_callid.drop_duplicates()
+    return TwoHourRGcallid_callid
+
+#把连表
+def MergeTable1(df3):
+    df3 = pd.merge(df3, TwoHourZRG_callid, how = 'left', on = ['CALLID'])
+    df3 = pd.merge(df3, TwoHourRGcallid_callid, how = 'left', on = ['CALLID'])
+    return df3
+
+#建立统计结果过程表
+def CountResult(df4):
+#    df5 = df4[df4['特殊客户'].isnull()]
+    df_nonrg = df4[df4.apply(lambda x:x['纯人工'] != 1 and x['转人工'] != 1 and type(x['RGCALLID']) == float,axis=1)]
+    df_yijie = df_nonrg[df_nonrg.apply(lambda x:x['两小时内转人工'] != 1 
+                                       and x['两小时内相同场景'] != 1 and  x['两小时内进入rgcallid'] != 1,axis=1)]
+    #用于统计删除原因
+    df_crg = df4[df4['纯人工'] == 1]
+    df_zrg = df4[df4['转人工'] == 1]
+  #  df_rgcallid = df4[df4['RGCALLID'].notnull()]
+    df_rgcallid = df4[df4.apply(lambda x: type(x['RGCALLID']) != float,axis=1)]
+    return  df_nonrg, df_yijie, df_crg, df_zrg, df_rgcallid
+
+#输出统计结果
+def PrintResult(df4, loc_, month_, day_):
+    print("地点：%s\n" % loc_)
+    print("时间：%d月%d日" % (month_,day_))
+    print("计算单位：通话")
+    print('-'*50)
+    
+    print("一解率：", len(df_yijie)/len(df_nonrg))
+    print("总通话数： %d，删除数： %d, 一解数： %d， 非一解数： %d" % 
+          (len(df4), (len(df4)-len(df_nonrg)), len(df_yijie), (len(df_nonrg)-len(df_yijie))))
+    print('-'*50)
+
+    print("非一解打标失败具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）")
+    print("进入“转人工”场景： %d, 未进入纯人工场景的RGCALLID： %d,  多通电话命中相同场景： %d" % 
+          (len(df_nonrg[df_nonrg['两小时内转人工']==1]), len(df_nonrg[df_nonrg['两小时内进入rgcallid']==1]),
+              len(df_nonrg[df_nonrg['两小时内相同场景'] == 1])))
+    print('-'*50)
+
+    print("剔除数据具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）")
+    print("剔除转人工场景数： %d, 剔除纯人工场景： %d, 剔除rgcallid数： %d" % 
+          ( len(df_zrg), len(df_crg), len(df_rgcallid)))      
+#    print("剔除特殊客户： %d,   剔除转人工场景数： %d, 剔除纯人工场景： %d, 剔除rgcallid数： %d" % 
+ #         ((len(df4)-len(df5)),  len(df_zrg), len(df_crg), len(df_rgcallid)))  
+    
+#输出统计结果到txt文件里面
+def ResultToFile(df4, filepath):    
+    with open(filepath, "a+", encoding='gbk') as f:
+        f.write("地点：%s\n" % loc_)
+        f.write("时间：%d月%d日\n" % (month_,day))
+        f.write("计算单位：通话\n")
+        f.write('\n')
+
+        f.write("一解率： %f\n" % (len(df_yijie)/len(df_nonrg)))
+        f.write("总通话数： %d，删除数： %d, 一解数： %d， 非一解数： %d\n" % 
+          (len(df4), (len(df4)-len(df_nonrg)), len(df_yijie), (len(df_nonrg)-len(df_yijie))))
+        f.write('\n')
+
+        f.write("非一解打标失败具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+        f.write("进入“转人工”场景： %d, 未进入纯人工场景的RGCALLID： %d,  多通电话命中相同场景： %d\n" % 
+          (len(df_nonrg[df_nonrg['两小时内转人工']==1]), len(df_nonrg[df_nonrg['两小时内进入rgcallid']==1]),
+              len(df_nonrg[df_nonrg['两小时内相同场景'] == 1])))
+        f.write('\n')
+
+        f.write("剔除数据具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+        f.write("剔除转人工场景数： %d, 剔除纯人工场景： %d, 剔除rgcallid数： %d\n" % 
+          (len(df_zrg), len(df_crg), len(df_rgcallid)))
+        
+        
+def GetResultDate(filepath):
+    with open(filepath, encoding='gbk') as file:
+        data = file.readlines()
+             
+    time_ = []; rate_ = [];site_ = []
+    totalcallid_ = []; delcallid_ = []; yijie_ = []; nonyijie_ = []
+    zhuanrg_ = []; chunrg_ = []; same_ = []   
+    delzhuanrg_ = []; delchunrg_ = []; delrgcallid_ = [] ; #delteshu = []
+    site = re.findall(r'_([\u4e00-\u9fa5\d]+)', filepath)[1]
+  #  site = re.findall(r'_([\u4e00-\u9fa5\d]+)', filepath)[0]
+    
+    for line in data:
+        if '时间' in line:
+            time_.append(re.findall(r'时间：([\u4e00-\u9fa5\d]+)', line)[0])    
+        if '一解率：' in line:
+            rate_.append(re.findall(r'一解率： ([\d.]+)', line)[0])    
+        if '总通话数：'in line:
+            totalcallid_.append(re.findall(r'总通话数： ([\d.]+)', line)[0])    
+        if '删除数：'in line:
+            delcallid_.append(re.findall(r'删除数： ([\d.]+)', line)[0])   
+        if '一解数：'in line:
+            yijie_.append(re.findall(r'一解数： ([\d.]+)', line)[0])   
+        if '非一解数：'in line:
+            nonyijie_.append(re.findall(r'非一解数： ([\d.]+)', line)[0])   
+        if '进入“转人工”场景：'in line:
+            zhuanrg_.append(re.findall(r'进入“转人工”场景： ([\d.]+)', line)[0])   
+        if '未进入纯人工场景的RGCALLID：'in line:
+            chunrg_ .append(re.findall(r'未进入纯人工场景的RGCALLID： ([\d.]+)', line)[0])   
+        if '多通电话命中相同场景：'in line:
+            same_.append(re.findall(r'多通电话命中相同场景： ([\d.]+)', line)[0])   
+        if '剔除转人工场景数：'in line:
+            delzhuanrg_.append(re.findall(r'剔除转人工场景数： ([\d.]+)', line)[0])   
+        if '剔除纯人工场景：'in line:
+            delchunrg_.append(re.findall(r'剔除纯人工场景： ([\d.]+)', line)[0])   
+        if '剔除rgcallid数：'in line:
+            delrgcallid_.append(re.findall(r'剔除rgcallid数： ([\d.]+)', line)[0]) 
+            
+  #      if '剔除特殊客户：' in line:
+   #         delteshu.append(re.findall(r'剔除特殊客户： ([\d.]+)', line)[0]) 
+
+    for i in range(len(time_)):
+        yield (site, time_[i], float(rate_[i]), int(totalcallid_[i]),int(delcallid_[i]), int(yijie_[i]),int(nonyijie_[i]),
+               int(zhuanrg_[i]), int(chunrg_[i]), int(same_[i]), int(delzhuanrg_[i]), int(delchunrg_[i]), int(delrgcallid_[i]))
+
+'''
+    for i in range(len(time_)):
+        yield (site, time_[i], float(rate_[i]), int(totalcallid_[i]),int(delcallid_[i]), int(yijie_[i]),int(nonyijie_[i]),
+               int(zhuanrg_[i]), int(chunrg_[i]), int(same_[i]), int(delzhuanrg_[i]), int(delchunrg_[i]), int(delrgcallid_[i]),
+                  int(delteshu[i]))
+'''
+
+def GetFilepath(path, find):
+    '''
+    :param path:输入查找路径
+    :param find:输入变量为excel用于识别清单、txt用于统计结果
+    :return:返回路径+文件名的文件列表
+    '''
+    filelist = os.listdir(path)    
+    file_= []
+    if find == 'excel':
+        for file in filelist:    #寻找所需文件名
+            if  'xlsx' in file:   #原始文件的BUG才采用的方式
+                file_.append(file)
+    elif find == 'txt':
+        for file in filelist:
+            if  'txt' in file:
+                file_.append(file)    
+    elif find == 'csv':
+        for file in filelist:    #寻找所需文件名
+            if  'csv' in file:
+                file_.append(file)    
+            
+    filelist = []
+    for file in file_:      #健全文件名名称，和创建各省数据集  
+        file = '\\'.join([path, file])        
+        filelist.append(file) 
+    return filelist
+
+        
+#----------------按场景维度一解率
+        #2小时内相同场景的callid
+def getSameTable_CJB(df2):
+    number_list = list(set(df2['CALLNUM']))   
+    for number in number_list:
+        df_ = df2[df2['CALLNUM'] == number]
+        df_ = df_.sort_values(by=['CALLID', 'DTIME'], ascending = True).reset_index(drop=True)
+        time_list = list(df_['DTIME'])
+        callid_list = list(df_['CALLID'])
+        result_ = list(df_['SBJG'])
+        length = len(result_)
+
+        for i in range(length):
+            for j in range(length):
+                s_ = (time_list[j] - time_list[i]).seconds
+                d_ = (time_list[j] - time_list[i]).days   
+                if d_ == 0 and s_ >= 0 and s_ < 7200:    #待测试
+                    rr = result_[j]; cc = callid_list[j]
+                    if result_[i] == rr and str(callid_list[i]) != str(cc):
+                        yield(callid_list[i], time_list[i], result_[i], 1)
+                        break 
+
+def Merge_FromCJ1(df1, chun_callid,zrg_callid,rgcallid_callid):
+    df2 = pd.merge(df1, chun_callid, how = 'left', on=['CALLID'])
+    df2 = pd.merge(df2, zrg_callid, how = 'left', on=['CALLID'])
+    df2 = pd.merge(df2, rgcallid_callid, how = 'left', on = ['CALLID'])
+    df2.drop('纯人工_x', axis=1,inplace=True) 
+    df2.drop('转人工_x', axis=1,inplace=True) 
+    df2.drop('RGCALLID_y', axis=1, inplace=True) 
+    df2.columns = ['CALLNUM', 'DTIME', 'SBJG', 'CALLEDNUM', 'CALLID', 'RGCALLID', 'WFROM',
+           'rgcallid', '纯人工', '转人工']    
+ #   df2.columns = ['CALLNUM', 'DTIME', 'SBJG', 'CALLEDNUM', 'CALLID', 'RGCALLID', 'WFROM',
+  #          '纯人工', '转人工','rgcallid']
+    return df2
+
+def Merge_FromCJ2(df2, same_callid, TwoHourZRG_callid, TwoHourRGcallid_callid):
+    df3 = pd.merge(df2, same_callid, how = 'left', on = ['CALLID','SBJG','DTIME'])
+    df3 = pd.merge(df3, TwoHourZRG_callid, how = 'left', on = ['CALLID'])
+    df3 = pd.merge(df3, TwoHourRGcallid_callid, how = 'left', on = ['CALLID'])
+    return df3
+
+def GetResult_CJ(df3):
+    df_nonrg = df3[df3.apply(lambda x:
+                   x['纯人工'] != 1 and x['转人工'] != 1 and type(x['RGCALLID']) == float,axis=1)]
+  #  df_nonrg = df3[df3.apply(lambda x:
+   #                x['纯人工'] != 1 and x['转人工'] != 1 and x['rgcallid'] != 1, axis=1)]
+    df_yijie = df_nonrg[df_nonrg.apply(lambda x:x['两小时内转人工'] != 1 and x['两小时内相同场景'] != 1 
+                                       and  x['两小时内进入rgcallid'] != 1,axis=1)]
+    #用于统计删除原因
+    df_crg = df3[df3['纯人工'] == 1]
+    df_zrg = df3[df3['转人工'] == 1]
+    df_rgcallid = df3[df3.apply(lambda x: type(x['RGCALLID']) != float,axis=1)]   
+ #   df_rgcallid = df3[df3['rgcallid'] == 1]   
+    #用于统计打标失败原因
+    df_twohour_zrg = df_nonrg[df_nonrg['两小时内转人工'] == 1]
+    df_twohour_rgcallid = df_nonrg[df_nonrg['两小时内进入rgcallid'] == 1]
+    df_twohour_same = df_nonrg[df_nonrg['两小时内相同场景'] == 1]
+
+    #总统计情况
+    df_cj = df3.groupby(['SBJG']).count()[['CALLID']]
+    df_nonrg_cj = df_nonrg.groupby(['SBJG']).count()[['CALLID']]
+    df_yijie_cj = df_yijie.groupby(['SBJG']).count()[['CALLID']]
+    #删除通话原因
+    df_crg_cj = df_crg.groupby(['SBJG']).count()[['CALLID']]
+    df_zrg_cj = df_zrg.groupby(['SBJG']).count()[['CALLID']]
+    df_rgcallid_cj = df_rgcallid.groupby(['SBJG']).count()[['CALLID']]
+    #打标失败原因
+    df_twohour_zrg_cj = df_twohour_zrg.groupby(['SBJG']).count()[['CALLID']]
+    df_twohour_rgcallid_cj = df_twohour_rgcallid.groupby(['SBJG']).count()[['CALLID']]
+    df_twohour_same_cj = df_twohour_same.groupby(['SBJG']).count()[['CALLID']]
+    
+    #总统计情况
+    df4 = df_cj.merge(df_nonrg_cj, left_index=True, right_index=True, how = 'left')
+    df4 = df4.merge(df_yijie_cj, left_index=True, right_index=True, how = 'left')
+    #删除通话原因
+    df4 = df4.merge(df_crg_cj, left_index=True, right_index=True, how = 'left')
+    df4 = df4.merge(df_zrg_cj, left_index=True, right_index=True, how = 'left')
+    df4 = df4.merge(df_rgcallid_cj, left_index=True, right_index=True, how = 'left')
+    #打标失败原因
+    df4 = df4.merge(df_twohour_zrg_cj, left_index=True, right_index=True, how = 'left')
+    df4 = df4.merge(df_twohour_rgcallid_cj, left_index=True, right_index=True, how = 'left')
+    df4 = df4.merge(df_twohour_same_cj, left_index=True, right_index=True, how = 'left')
+    df4.columns = ['总命中量','统计量','一解量','删除纯人工量','删除转人工量',
+                    '删除rgcallid量','两小时内转人工量','两小时内进入rgcallid量','两小时进相同场景量']
+    df4 = df4.fillna(0)    
+    
+    df4['删除量'] = df4['总命中量'] - df4['统计量']
+    df4['一解率'] = df4['一解量'] / df4['统计量']
+    return df4.sort_values(by = ['总命中量'],ascending = False)
+
+def GetResult_CJ_Provice(df4):
+    df_provice = df4.groupby(by=['SBJG']).sum()[['总命中量', '统计量', '一解量', '删除纯人工量', '删除转人工量',
+        '删除rgcallid量', '两小时内转人工量', '两小时内进入rgcallid量', '两小时进相同场景量', '删除量']]
+    df_provice['一解率'] = df_provice['一解量']/df_provice['统计量']
+    return df_provice
+
+    
+#-----------------------------主体统计代码-------------------------------
+#-----------------19.3.14跑取全省各地市一解率代价
+#选择地市和时间
+'''
+#深圳数据获取情况
+with open(r'D:\数据文件\识别清单\1月全省清单\深圳.csv', encoding='utf-8') as file:
+    df = pd.read_csv(file)
+    df.columns = ['CALLEDNUM', 'CALLNUM', 'CALLID', 'DTIME', 'SBJG','WFROM', 'RGCALLID', '客户分群', '语种']   #若平台取数需重新命名字段名
+    df['DTIME'] = pd.to_datetime(df['DTIME'])
+    df = df[['CALLNUM', 'DTIME', 'SBJG', 'CALLEDNUM', 'CALLID', 'RGCALLID','WFROM']]   #保存主要字段
+'''
+filelist = GetFilepath(r'D:\数据文件\识别清单\1月全省清单','excel')
+for file in  filelist[1:2]: 
+    start = time.clock()
+    df = GetData(file)
+    
+    loc_ = list(df['CALLEDNUM'].unique())   #获取数据各地市列表
+    day_ = list(df['DTIME'].apply(lambda x: x.day).unique())   #获取数据中各天数列表
+    month_ = list(df['DTIME'].apply(lambda x: x.month).unique())[0]  #手动调整
+    for loc in loc_:
+        #获取地市和时间维度下的数据
+        dele_list = get_delelist(r'D:\数据文件\纯人工业务场景（深圳区域中心）.txt', loc)
+        for day in day_:
+            midtime = time.clock()
+            df1 = GetDataByLoc(df, loc)
+            df1 = GetDataByDay(df1, day)
+            #创建匹配表之需删除内容
+            #创建纯人工场景映射表
+            
+            chun_callid = SetDelelist(df1, dele_list) 
+            zrg_callid = SetZRGlist(df1, dele_list)
+            #创建rgcallid映射表
+            rgcallid_callid = SetRgcallidTable(df1)
+            #将同通电话的不同识别结果汇聚一行，字段：主叫号码，拨打该通电话的起始时间，识别场景列表，该通电话的callid
+            df3 = pd.DataFrame(order_by_callid(df1))
+            df3.columns = ['CALLNUM','time_start','result_list','CALLID']    
+            #创建同场景判断映射表
+            same_callid = SetSameTable(df3)
+            df4 = MergeTable(df3)    #表匹配
+            
+            #创建匹配表之需判断一解条件内容
+            #创建”转人工“场景判断映射表
+            TwoHourZRG_callid = Settwohour_ZRGTable(df4)
+            #创建2小时内用户进入人工队列（rgcallid)判断映射表
+            TwoHourRGcallid_callid = Settwohour_RGcallidTable(df4)
+            #剩余匹配表连接起来
+            df4 = MergeTable1(df4)   
+            
+            #统计一解率结果，输出最终结果
+            df_nonrg, df_yijie, df_crg, df_zrg, df_rgcallid = CountResult(df4)
+            PrintResult(df4, loc, month_, day)        #输出统计结果
+            # 批量输出文件方式
+            file_mark = r'D:\数据文件\按地市广东省(外部版)'
+            temp = ''.join([str(month_), '月',str(day), '日'])
+            file_mark = '_'.join([file_mark, loc, temp])
+            file_mark = '.'.join([file_mark, 'csv'])
+            
+            file_result = r'D:\数据文件\按地市广东省(外部版)'
+            file_result = '_'.join([file_result, loc, str(month_)])
+            file_result = '.'.join([file_result, 'txt'])
+            
+            with open(file_result, 'a+', encoding='gbk') as f:
+                f.write("地点：%s\n" % loc)
+                f.write("时间：%d月%d日\n" % (month_,day))
+                f.write("计算单位：通话\n")
+                f.write('\n')
+            
+                f.write("一解率： %f\n" % (len(df_yijie)/len(df_nonrg)))
+                f.write("总通话数： %d，删除数： %d, 一解数： %d， 非一解数： %d\n" % 
+                  (len(df4), (len(df4)-len(df_nonrg)), len(df_yijie), (len(df_nonrg)-len(df_yijie))))
+                f.write('\n')
+            
+                f.write("非一解打标失败具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+                f.write("进入“转人工”场景： %d, 未进入纯人工场景的RGCALLID： %d,  多通电话命中相同场景： %d\n" % 
+                  (len(df_nonrg[df_nonrg['两小时内转人工']==1]), len(df_nonrg[df_nonrg['两小时内进入rgcallid']==1]),
+                      len(df_nonrg[df_nonrg['两小时内相同场景'] == 1])))
+                f.write('\n')
+        
+                f.write("剔除数据具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+                f.write("剔除转人工场景数： %d, 剔除纯人工场景： %d, 剔除rgcallid数： %d\n" % 
+                  (len(df_zrg), len(df_crg), len(df_rgcallid)))
+                time.sleep(0.001)
+    
+            df4.to_csv(file_mark,encoding='gbk')
+            print('-'*50)
+            print(file_result)
+            print(file_mark)
+            elapsed = (time.clock() -  midtime)
+            print("pro Time used:",elapsed)
+        
+    elapsed = (time.clock() - start)
+    print("endding Time used:",elapsed)        
+        
+#获取文件夹统计结果文件
+filelist = GetFilepath(r'C:\Users\zero\Desktop\一解率\4.统计结果\按地市广东省(外部版)_4','txt')
+#批量处理文件并汇总为统计结果
+data_sum = pd.DataFrame(columns=['地市','时间','一解率','总通话数','删除数','一解数','非一解数','2小时内进入“转人工”场景',
+                                "2小时内进入rgcallid","2小时内进入相同场景", "删除“转人工”场景数","删除纯人工场景数","删除rgcallid数"])
+for file in  filelist: 
+    data = pd.DataFrame(GetResultDate(file),
+           columns = ['地市','时间','一解率','总通话数','删除数','一解数','非一解数','2小时内进入“转人工”场景',
+                     "2小时内进入rgcallid","2小时内进入相同场景", "删除“转人工”场景数","删除纯人工场景数","删除rgcallid数"])    #逐条汇总文件内容
+    data_sum = pd.concat([data_sum, data])
+#保存汇总结果
+data_sum.to_excel(r'C:\Users\zero\Desktop\一解率\4.统计结果\按地市广东省(外部版)_4\四月地市一解率汇总表.xlsx', encoding='gbk')
+  
+
+
+
+        
+#-----------------按场景维度一解率统计
+filelist = GetFilepath(r'D:\数据文件\识别清单\0422-0428','excel')
+for file in  filelist: 
+    start = time.clock()
+    df = GetData(file)
+    
+    loc_ = list(df['CALLEDNUM'].unique())   #获取数据各地市列表
+  #  loc_ = ['广州']
+    day_ = list(df['DTIME'].apply(lambda x: x.day).unique())   #获取数据中各天数列表
+    month_ = list(df['DTIME'].apply(lambda x: x.month).unique())[0]
+    for loc in loc_:
+        #获取地市和时间维度下的数据
+        for day in day_:
+            midtime = time.clock()
+            df1 = GetDataByLoc(df, loc)
+            df1 = GetDataByDay(df1, day)
+            
+            #创建匹配表之需删除内容
+            #创建纯人工场景映射表
+            dele_list = get_delelist(r'D:\数据文件\纯人工业务场景（深圳区域中心）.txt', loc)
+            chun_callid = SetDelelist(df1, dele_list)
+            zrg_callid = SetZRGlist(df1, dele_list)
+            #创建rgcallid映射表
+            rgcallid_callid = SetRgcallidTable(df1)
+            #匹配映射表之各删除表
+            df2 = Merge_FromCJ1(df1, chun_callid, zrg_callid, rgcallid_callid)
+        
+            #创建各是否一解条件判断映射表
+            same_callid = SetSameTable(df2)    #创建同场景判断映射表
+            TwoHourZRG_callid = Settwohour_ZRGTable(df2)    #创建”转人工“场景判断映射表
+            TwoHourRGcallid_callid = Settwohour_RGcallidTable(df2)   #创建2小时内用户进入人工队列（rgcallid)判断映射表
+            #匹配映射表之各一解判断映射表
+            df3 = Merge_FromCJ2(df2, same_callid, TwoHourZRG_callid, TwoHourRGcallid_callid)
+            df4 = GetResult_CJ(df3)
+        
+            # 批量输出文件方式
+            file_mark = r'D:\数据文件\按场景打标结果(外部版)'
+            temp = ''.join([str(month_), '月',str(day), '日'])
+            file_mark = '_'.join([file_mark, loc, temp])
+            file_mark = '.'.join([file_mark, 'csv'])
+            
+            file_result = r'D:\数据文件\按场景打标结果(外部版)'
+            file_result = '_'.join([file_result, loc, temp])
+            file_result = '.'.join([file_result, 'xlsx'])
+            
+            df3.to_csv(file_mark, encoding='gbk')
+            df4.to_excel(file_result, encoding='gbk')
+            
+            print('-'*50)
+            print(file_result)
+            print(file_mark)
+            elapsed = (time.clock() - midtime)
+            print("pro Time used:", elapsed)
+        
+    elapsed = (time.clock() - start)
+    print("endding Time used:", elapsed)
+
+
+#19.03.26汇总各地市统计结果
+#获取文件夹统计结果文件
+filelist = GetFilepath(r'C:\Users\zero\Desktop\一解率\4.统计结果\按场景广东省(外部版)_4','excel')    
+
+#def GetResultData_CJ(file):
+yijie_list = pd.read_excel(r'D:\数据文件\一解率场景.xlsx')
+yijie_list = list(yijie_list['一解率场景'])
+
+def DelNoyijie(filepath):
+    data = pd.read_excel(filepath) 
+    data.columns = ['SBJG', '总命中量', '统计量', '一解量', '删除纯人工量', '删除转人工量', '删除rgcallid量',
+       '两小时内转人工量', '两小时内进入rgcallid量', '两小时进相同场景量', '删除量', '一解率']   #可能需要更改
+    
+    data['SBJG'] = data['SBJG'].apply(lambda x: re.search(r'月度话费查询', x).group() if '月度话费查询' in x else x)
+    data = data[data['SBJG'].apply(lambda x:x in yijie_list)]
+    data =  data.groupby(['SBJG']).sum().reset_index()
+    #按照实际情况进行变动
+    site = re.findall(r'_([\u4e00-\u9fa5\d]+)', filepath)[1]
+    date = re.findall(r'_([\u4e00-\u9fa5\d]+)' ,filepath)[2]
+    data['一解率'] = data['一解量'] / data['统计量']
+    data['地市'] = site
+    data['日期'] = date    
+    return data
+
+
+data_sum = pd.DataFrame(columns=['SBJG', '总命中量', '统计量', '一解量', '删除纯人工量', '删除转人工量', '删除rgcallid量',
+       '两小时内转人工量', '两小时内进入rgcallid量', '两小时进相同场景量', '删除量', '一解率', '地市', '日期'])
+for file in filelist[2:632]: 
+    data = DelNoyijie(file)
+    data_sum = pd.concat([data_sum, data])
+
+df_provice = GetResult_CJ_Provice(data_sum)
+
+data_sum.to_excel(r'C:\Users\zero\Desktop\一解率\4.统计结果\按场景广东省(外部版)_4\四月全省场景一解率汇总表.xlsx', encoding='gbk',sheet_name='数据源')
+
+
+df_provice.to_excel(r'C:\Users\zero\Desktop\一解率\统计结果\按场景广东省(外部版)_1\全省场景一解率汇总表V1.1.xlsx', encoding='gbk',sheet_name='全省场景维度一解率情况')
+
+
+
+ 
+
+
+data_sum = pd.DataFrame(columns=["占比", "地点", "日期"])
+filelist = GetFilepath(r'C:\Users\zero\Desktop\一解率\统计结果\按地市广东省(外部版)_3','csv')
+   
+for file in filelist:
+    with open(file) as f:
+        data = pd.read_csv(f)
+        df =  data.groupby(['CALLNUM']).count()[['CALLID']]
+        df = df.reset_index()
+        count = df.groupby(['CALLID']).count()
+        count.columns = ['占比']
+        
+        date =  re.findall(r'_([\u4e00-\u9fa5\d]+)', file)[2]
+        site = re.findall(r'_([\u4e00-\u9fa5\d]+)', file)[1]
+        count['地点'] = site
+        count['日期'] = date
+        data_sum = pd.concat([data_sum, count])
+  
+data_sum1 = data_sum.reset_index()
+data_sum1 = data_sum1.groupby(['地点','日期','index']).sum()
+data_sum1 = data_sum1.reset_index()
+
+
+
+cishu = list(data_sum1['index'])
+group1 = []; group2 = []
+for i in cishu:
+    if i == 1:
+        group1.append('1次')
+        group2.append('1次')
+    elif i == 2:
+        group1.append('2次')
+        group2.append('2次以上')
+    elif i == 3:
+        group1.append('3次')
+        group2.append('2次以上')
+    elif i >= 4:
+        group1.append('4次以上')
+        group2.append('2次以上')
+data_sum1['分群1'] = group1
+data_sum1['分群2'] = group2
+
+data_sum1.to_excel(r'C:\Users\zero\Desktop\1-3月用户拨打次数统计.xlsx')
+
+
+
+
+
+start = time.clock()
+df = GetData(r'C:\Users\zero\Desktop\一解率\客户数据\智能语音一解率厂家提数\深圳4.1-4.14.xlsx')
+
+rgcallid_callid = df[df['RGCALLID'].notnull()][['CALLID','SBJG']].drop_duplicates()
+rgcallid_callid = rgcallid_callid[rgcallid_callid['SBJG'] != '话费查询']
+rgcallid_callid['RGCALLID'] = 1
+
+
+
+loc = '深圳'
+day_ = list(df['DTIME'].apply(lambda x: x.day).unique())   #获取数据中各天数列表
+month_ = 4   #手动调整
+
+#del_number = GetNumber(r'C:\Users\zero\Desktop\一解率\客户数据\特殊客户配置清单（特殊客户配置）165732[为准].xls')
+dele_list = get_delelist(r'C:\Users\zero\Desktop\一解率\客户数据\智能语音一解率厂家提数\纯人工业务场景（深圳区域中心）.txt', loc)      
+#获取地市和时间维度下的数据
+for day in day_[9:10]:
+    midtime = time.clock()
+    df1 = GetDataByDay(df, day)
+    #创建匹配表之需删除内容
+    #创建纯人工场景映射表
+    chun_callid = SetDelelist(df1, dele_list) 
+    zrg_callid = SetZRGlist(df1, dele_list)
+    #创建特殊客户映射表
+ #   number_ = SetNumber(df1, del_number)
+    #创建rgcallid映射表
+    rgcallid_callid = SetRgcallidTable(df1)
+    #将同通电话的不同识别结果汇聚一行，字段：主叫号码，拨打该通电话的起始时间，识别场景列表，该通电话的callid
+    df3 = pd.DataFrame(order_by_callid(df1))
+    df3.columns = ['CALLNUM','time_start','result_list','CALLID']    
+    #创建同场景判断映射表
+    same_callid = SetSameTable(df3)
+    df4 = MergeTable(df3)    #表匹配
+    
+    #创建匹配表之需判断一解条件内容
+    #创建”转人工“场景判断映射表
+    TwoHourZRG_callid = Settwohour_ZRGTable(df4)
+    #创建2小时内用户进入人工队列（rgcallid)判断映射表
+    TwoHourRGcallid_callid = Settwohour_RGcallidTable(df4)
+    #剩余匹配表连接起来
+    df4 = MergeTable1(df4)
+        
+    #统计一解率结果，输出最终结果
+    df_nonrg, df_yijie, df_crg, df_zrg, df_rgcallid = CountResult(df4)
+    PrintResult(df4, loc, month_, day)        #输出统计结果
+    # 批量输出文件方式
+    file_mark = r'C:\Users\zero\Desktop\一解率\统计结果\按地市广东省(外部版)_4\按地市广东省(外部版)剔除特殊客户情况'
+    temp = ''.join([str(month_), '月',str(day), '日'])
+    file_mark = '_'.join([file_mark, loc, temp])
+    file_mark = '.'.join([file_mark, 'csv'])
+    
+    file_result = r'C:\Users\zero\Desktop\一解率\统计结果\按地市广东省(外部版)_4\按地市广东省(外部版)剔除特殊客户情况'
+    file_result = '_'.join([file_result, loc, str(month_)])
+    file_result = '.'.join([file_result, 'txt'])
+    
+    with open(file_result, 'a+', encoding='gbk') as f:
+        f.write("地点：%s\n" % loc)
+        f.write("时间：%d月%d日\n" % (month_,day))
+        f.write("计算单位：通话\n")
+        f.write('\n')
+    
+        f.write("一解率： %f\n" % (len(df_yijie)/len(df_nonrg)))
+        f.write("总通话数： %d，删除数： %d, 一解数： %d， 非一解数： %d\n" % 
+          (len(df4), (len(df4)-len(df_nonrg)), len(df_yijie), (len(df_nonrg)-len(df_yijie))))
+        f.write('\n')
+    
+        f.write("非一解打标失败具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+        f.write("进入“转人工”场景： %d, 未进入纯人工场景的RGCALLID： %d,  多通电话命中相同场景： %d\n" % 
+          (len(df_nonrg[df_nonrg['两小时内转人工']==1]), len(df_nonrg[df_nonrg['两小时内进入rgcallid']==1]),
+              len(df_nonrg[df_nonrg['两小时内相同场景'] == 1])))
+        f.write('\n')
+
+        f.write("剔除数据具体情况:（部分话单两者条件都存在，但一解率统计时不存在重复剔除情况）\n")
+        f.write("剔除特殊客户： %d, 剔除转人工场景数： %d, 剔除纯人工场景： %d, 剔除rgcallid数： %d\n" % 
+          ((len(df4)-len(df5)),  len(df_zrg), len(df_crg), len(df_rgcallid)))
+        time.sleep(0.001)
+
+    df4.to_csv(file_mark,encoding='gbk')
+    print('-'*50)
+    print(file_result)
+    print(file_mark)
+    elapsed = (time.clock() -  midtime)
+    print("pro Time used:",elapsed)
+    
+elapsed = (time.clock() - start)
+print("endding Time used:",elapsed)       
+
+
+
+filelist = GetFilepath(r'C:\Users\zero\Desktop\剔除特殊客户','txt')
+data_sum = pd.DataFrame(columns=['地市','时间','一解率','总通话数','删除数','一解数','非一解数','2小时内进入“转人工”场景',
+                                "2小时内进入rgcallid","2小时内进入相同场景", "删除“转人工”场景数",
+                                "删除纯人工场景数","删除rgcallid数","剔除特殊客户数"])
+for file in  filelist: 
+    data = pd.DataFrame(GetResultDate(file),
+           columns = ['地市','时间','一解率','总通话数','删除数','一解数','非一解数','2小时内进入“转人工”场景',
+                     "2小时内进入rgcallid","2小时内进入相同场景", "删除“转人工”场景数",
+                     "删除纯人工场景数","删除rgcallid数","剔除特殊客户数"])    #逐条汇总文件内容
+    data_sum = pd.concat([data_sum, data])
+#保存汇总结果
+data_sum.to_excel(r'C:\Users\zero\Desktop\剔除特殊客户\剔除特殊客户深圳一解率统计结果_3.xlsx', encoding='gbk')
+                  
+
+
